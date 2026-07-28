@@ -3,67 +3,79 @@ cogs/qb.py
 
 Modification():
 
-- 原本的版本在 load() 裡呼叫 self._split_names／self._handle，
-  但這兩個方法整支檔案都沒有定義，指令一用就會噴 AttributeError，
-  形同虛設。整份重寫成真正能動的 Minecraft 伺服器備份／回復指令：
-  !!qb make、!!qb back。
-- 加上頻道與身分組雙重限制、owner 私訊通知、同一時間只能跑一個
-  備份／回復（asyncio.Lock）、回復前用按鈕二次確認、回復前自動
-  幫現況存一份快照，避免手滑回錯備份就再也回不去。
-- 狀態訊息用同一則訊息一路 edit 下去，貼近原本手動連進終端機看到的
-  「正在備份...【成功】...」那種輸出感覺。
-
-- 新增 !!info：查看伺服器目前線上／離線，跟最近 10 次 make／back
-  紀錄（誰、做了什麼、結果如何）。make／back 不管成功失敗，
-  只要真的動手做了（過了鎖跟身分驗證），就會記一筆進
-  core/qb/history.py，重開 bot 紀錄也還在。
-
-- config.OWNER_ID 現在由 config.py 開機時保證一定有值（缺了直接
-  拒絕啟動），_notify_owner 不用再自己檢查是否為空。
-
-- 整合 RCON（core/qb/rcon.py）：make／back 關伺服器前會先廣播提醒玩家，
-  等一段緩衝時間再真的送 stop，不會讓正在玩的人毫無預警被踢出去。
-  !!info 也會在伺服器線上時，順便顯示 RCON 查到的線上玩家名單。
-  RCON 沒設定的話這些都自動跳過，不影響備份／回復本身。
+- 指令全面改成 slash commands：`!!qb make`／`!!qb back` 改成
+  `/qb make`／`/qb back`，`!!info` 改成 `/info`。原本「沒有權限就
+  整個不回應」在 slash command 上行不通——Discord 規定互動一定要在
+  時間內回應，不回應的話使用者只會看到「這個互動失敗了」這種更難懂
+  的錯誤，所以沒有權限時一律回一則只有本人看得到的提示。
+- 原本整段寫在指令函式裡的流程（取鎖 -> 關伺服器 -> 動檔案 -> 開
+  伺服器 -> 記錄）搬到 core/qb/backup.py 的 run_backup()／
+  run_restore()，這裡只負責：驗證權限、組出要顯示的訊息、把過程中
+  收到的進度文字接到同一則訊息下面、把結果分岔成幾種 Discord 訊息。
+  指令跟流程正式分開，這支檔案剩下的都是「介面」，看不到任何
+  tmux／tarfile 的細節。
+- 移除 RCON 整合：原本備份／回復前會先廣播提醒玩家、/info 會顯示
+  RCON 查到的線上玩家，這整套判定為用不到的設計，一併移除，
+  對應的 core/qb/rcon.py 也已刪除。
+- 新增 `/qb schedule on|off`：開關每日自動備份，開關狀態由
+  core/qb/scheduler.py 落地保存，重開 bot 也不會跑掉。開啟時會
+  回報下一次預計執行的時間。
+- 新增每日自動背景任務 `_daily_backup`：用 discord.ext.tasks 在
+  設定的時間觸發，開關為關就直接跳過；跑完不論成功失敗都會私訊
+  owner，成功的話另外呼叫 backup.rotate_auto_backups() 清掉太舊的
+  自動備份，避免每天執行、長期下來塞滿硬碟。背景任務本身把所有
+  例外都攔在內部，確保單次失敗不會讓之後每天都不會再觸發。
+- 鎖從「make／back 共用一個」改成呼叫 core/qb/backup.py 裡各自
+  的 backup_lock／restore_lock（相關保護實際上寫在 run_backup／
+  run_restore 內部），這裡的鎖檢查只是為了在真正開始跑之前，先
+  給使用者一個快速、非阻塞的提示。
 
 Description():
 
-- !!qb make [檔名]：關閉 MC 伺服器 -> 整包壓成 tar.gz -> 重啟伺服器。
-  檔名可以不給，不給就用時間戳記自動命名。有設 RCON 的話，關伺服器前
-  會先廣播提醒玩家。
-- !!qb back <檔名>：關閉 MC 伺服器 -> 用指定的備份整批換上 -> 重啟伺服器。
-  執行前要按按鈕確認，真正回復前還會自動多存一份現況快照保底，
-  一樣會先透過 RCON 廣播提醒。
-- !!info：看伺服器線上狀態（有 RCON 的話含線上玩家），跟最近 10 次
-  備份／回復的操作紀錄。
+- /qb make [檔名]：備份目前的世界存檔。
+- /qb back [檔名]：回復到指定備份，不帶檔名會先列出現有備份；
+  真正回復前需要按按鈕二次確認。
+- /qb schedule <on|off>：開關每日自動備份。
+- /info：查看伺服器狀態、每日自動備份開關與下次執行時間、最近 10
+  筆備份／回復紀錄。
+- _daily_backup：每天固定時間觸發的背景任務，開關開啟時才會真正
+  執行備份。
 """
 
 from __future__ import annotations
 
-import asyncio
+from datetime import time
 from typing import Optional
 
 import discord
-from discord.ext import commands
+from discord import app_commands
+from discord.ext import commands, tasks
 
 import config
 from core.logging.log import LogManager
-from core.qb import backup, history, rcon, server
+from core.qb import backup, history, scheduler, server, state
+from core.qb.exceptions import QBBusyError, QBError
+from core.qb.state import State
 
 logger = LogManager().get_logger("cogs.qb")
 
-# ── 同一時間只允許一個備份／回復作業，避免互相打架 ──────────────────────
-_lock = asyncio.Lock()
+_STATE_LABELS: dict[State, str] = {
+    State.IDLE: "閒置",
+    State.STARTING: "啟動中",
+    State.RUNNING: "線上",
+    State.STOPPING: "關閉中",
+    State.STOPPED: "離線",
+    State.BACKING_UP: "備份中",
+    State.RESTORING: "回復中",
+    State.FAILED: "上次操作失敗",
+}
 
-
-# ── 頻道與身分組雙重檢查 ──────────────────────
-
-def _authorized(ctx: commands.Context) -> bool:
-    if ctx.channel.id != config.QB_CHANNEL_ID:
-        return False
-    if not isinstance(ctx.author, discord.Member):
-        return False
-    return any(role.id == config.QB_ROLE_ID for role in ctx.author.roles)
+# ── 每日自動備份的觸發時間，開機時就固定下來，改設定要重啟 bot 才會生效 ──────────────────────
+_AUTO_BACKUP_TIME = time(
+    hour=config.QB_AUTO_BACKUP_HOUR,
+    minute=config.QB_AUTO_BACKUP_MINUTE,
+    tzinfo=config.QB_AUTO_BACKUP_TZ,
+)
 
 
 # ── 私訊 owner，失敗就記錄一下，不影響主流程 ──────────────────────
@@ -86,7 +98,10 @@ class _ConfirmView(discord.ui.View):
         self.message: Optional[discord.Message] = None
 
     async def interaction_check(self, interaction: discord.Interaction) -> bool:
-        return interaction.user.id == self.author_id
+        if interaction.user.id != self.author_id:
+            await interaction.response.send_message("只有原本下指令的人可以確認", ephemeral=True)
+            return False
+        return True
 
     @discord.ui.button(label="確認回復", style=discord.ButtonStyle.danger)
     async def confirm(self, interaction: discord.Interaction, _: discord.ui.Button) -> None:
@@ -112,161 +127,182 @@ class _ConfirmView(discord.ui.View):
 # ── 備份／回復 Cog ──────────────────────
 
 class QuickBackup(commands.Cog):
+    qb_group = app_commands.Group(name="qb", description="Minecraft 伺服器備份與回復")
+
     def __init__(self, bot: commands.Bot) -> None:
         self.bot = bot
+        self._daily_backup.start()
 
-    @commands.group(name="qb", invoke_without_command=True)
-    async def qb(self, ctx: commands.Context) -> None:
-        if not _authorized(ctx):
-            return
-        await ctx.send("指令：`!!qb make [檔名]` 備份、`!!qb back <檔名>` 回復")
+    def cog_unload(self) -> None:
+        self._daily_backup.cancel()
+
+    # ── 頻道與身分組雙重檢查 ──────────────────────
+    @staticmethod
+    def _authorized(interaction: discord.Interaction) -> bool:
+        if interaction.channel_id != config.QB_CHANNEL_ID:
+            return False
+        if not isinstance(interaction.user, discord.Member):
+            return False
+        return any(role.id == config.QB_ROLE_ID for role in interaction.user.roles)
 
     # ── 備份：關伺服器 -> 壓縮 -> 重啟 ──────────────────────
-    @qb.command(name="make")
-    async def make(self, ctx: commands.Context, *, filename: Optional[str] = None) -> None:
-        if not _authorized(ctx):
+    @qb_group.command(name="make", description="備份目前的世界存檔")
+    @app_commands.describe(filename="備份檔名，不填就自動用時間戳記命名")
+    async def make(self, interaction: discord.Interaction, filename: Optional[str] = None) -> None:
+        if not self._authorized(interaction):
+            await interaction.response.send_message("你沒有權限使用這個指令", ephemeral=True)
             return
 
-        if _lock.locked():
-            await ctx.send("現在有其他備份／回復作業在跑，等它跑完再試")
+        if state.backup_lock.locked() or state.server_lock.locked():
+            await interaction.response.send_message(
+                "現在有其他備份／回復作業在跑，等它跑完再試", ephemeral=True,
+            )
             return
 
         name = backup.sanitize_filename(filename) if filename else backup.default_filename()
+        operator = str(interaction.user)
 
-        async with _lock:
-            target = backup.backup_path(name)
-            status = f"正在備份 `{config.QB_SERVER_DIR}` 到 `{target}`..."
-            msg = await ctx.send(status)
-            await _notify_owner(self.bot, f"{ctx.author} 在頻道觸發備份：{name}")
+        await interaction.response.send_message(f"準備備份為 `{name}`...")
+        message = await interaction.original_response()
+        lines = [message.content]
 
-            if rcon.configured():
-                status += f" 廣播提醒玩家中（等 {config.QB_RCON_WARN_SECONDS} 秒）..."
-                await msg.edit(content=status)
-                await rcon.warn_and_wait(f"伺服器即將備份並重啟，{config.QB_RCON_WARN_SECONDS} 秒後關閉")
-                status += "完成，"
+        async def progress(text: str) -> None:
+            lines.append(text)
+            await message.edit(content="\n".join(lines))
 
-            status += " 關閉伺服器中..."
-            await msg.edit(content=status)
+        await _notify_owner(self.bot, f"{operator} 觸發備份：{name}")
 
-            if not await server.stop():
-                status += "逾時，伺服器沒關乾淨，備份中止，麻煩自己上去看一下"
-                await msg.edit(content=status)
-                logger.error("qb make：關閉伺服器逾時（操作者：%s）", ctx.author)
-                await _notify_owner(self.bot, f"備份中止：伺服器關閉逾時（{ctx.author}）")
-                history.record("make", str(ctx.author), name, False, "伺服器關閉逾時")
-                return
-            status += "完成，"
-
-            status += "壓縮中..."
-            await msg.edit(content=status)
-            ok, detail = await asyncio.to_thread(backup.create, name)
-
-            status += " 重啟伺服器中..."
-            restarted = server.start()
-            status += "完成。" if restarted else "沒能正常拉起來，麻煩自己上去看一下。"
-
-            if ok:
-                status += f"【成功】備份完成！檔案大小為：{detail}"
-                logger.info("備份完成：%s（%s，操作者：%s）", target, detail, ctx.author)
-            else:
-                status += f"【失敗】備份出包：{detail}"
-                logger.error("備份失敗：%s（操作者：%s）", detail, ctx.author)
-
-            history.record("make", str(ctx.author), name, ok, detail)
-            await msg.edit(content=status)
-            await _notify_owner(self.bot, status)
+        try:
+            outcome = await backup.run_backup(name, operator=operator, progress=progress)
+        except QBBusyError as exc:
+            await progress(str(exc))
+        except QBError as exc:
+            logger.error("備份失敗：%s（操作者：%s）", exc, operator)
+            text = f"【失敗】備份出包：{exc}"
+            await progress(text)
+            await _notify_owner(self.bot, text)
+        else:
+            logger.info("備份完成：%s（%s，操作者：%s）", name, outcome.size, operator)
+            text = (
+                f"【成功】備份完成，檔案大小 {outcome.size}"
+                f"（flow {outcome.flow_id}，耗時 {outcome.duration:.0f} 秒）"
+            )
+            await progress(text)
+            await _notify_owner(self.bot, text)
 
     # ── 回復：關伺服器 -> 換上指定備份 -> 重啟 ──────────────────────
-    @qb.command(name="back")
-    async def back(self, ctx: commands.Context, *, filename: Optional[str] = None) -> None:
-        if not _authorized(ctx):
+    @qb_group.command(name="back", description="回復到指定的備份")
+    @app_commands.describe(filename="要回復的備份檔名，不填則列出現有備份")
+    async def back(self, interaction: discord.Interaction, filename: Optional[str] = None) -> None:
+        if not self._authorized(interaction):
+            await interaction.response.send_message("你沒有權限使用這個指令", ephemeral=True)
             return
 
         if not filename:
             files = backup.list_backups()
             if not files:
-                await ctx.send("備份資料夾裡空空如也")
+                await interaction.response.send_message("備份資料夾裡空空如也", ephemeral=True)
                 return
-            listing = "\n".join(f"- {f.name.removesuffix('.tar.gz')}" for f in files[:10])
-            await ctx.send(f"要回復哪一份？\n{listing}")
+            listing = "\n".join(f"- {p.name.removesuffix('.tar.gz')}" for p in files[:10])
+            await interaction.response.send_message(f"要回復哪一份？\n{listing}", ephemeral=True)
             return
 
         name = backup.sanitize_filename(filename)
         if not backup.exists(name):
-            await ctx.send(f"找不到 `{name}` 這份備份，打 `!!qb back` 看看有哪些")
+            await interaction.response.send_message(
+                f"找不到 `{name}` 這份備份，打 `/qb back` 不帶檔名可以看現有清單", ephemeral=True,
+            )
             return
 
-        if _lock.locked():
-            await ctx.send("現在有其他備份／回復作業在跑，等它跑完再試")
+        if state.restore_lock.locked() or state.server_lock.locked():
+            await interaction.response.send_message(
+                "現在有其他備份／回復作業在跑，等它跑完再試", ephemeral=True,
+            )
             return
 
-        view = _ConfirmView(ctx.author.id)
-        prompt = await ctx.send(
-            f"確定要用 `{name}` 蓋掉現在的世界嗎？這動作沒有回頭路",
-            view=view,
+        view = _ConfirmView(interaction.user.id)
+        await interaction.response.send_message(
+            f"確定要用 `{name}` 蓋掉現在的世界嗎？這動作沒有回頭路", view=view,
         )
-        view.message = prompt
+        message = await interaction.original_response()
+        view.message = message
         await view.wait()
 
         if not view.confirmed:
             return
 
-        if _lock.locked():
-            await ctx.send("剛好有別的作業開始跑了，等等再試")
+        # 按鈕的 callback 已經把這則訊息改成「收到，開始處理...」，
+        # 重新抓一次目前內容，讓進度訊息接在這句後面，而不是接在
+        # view.message 那個舊物件、按鈕點下去之前的確認提示文字後面
+        message = await interaction.original_response()
+        operator = str(interaction.user)
+        lines = [message.content]
+
+        async def progress(text: str) -> None:
+            lines.append(text)
+            await message.edit(content="\n".join(lines))
+
+        await _notify_owner(self.bot, f"{operator} 觸發回復：{name}")
+
+        try:
+            outcome = await backup.run_restore(name, operator=operator, progress=progress)
+        except QBBusyError as exc:
+            await progress(str(exc))
+        except QBError as exc:
+            logger.error("回復失敗：%s（操作者：%s）", exc, operator)
+            text = f"【失敗】回復出包：{exc}"
+            await progress(text)
+            await _notify_owner(self.bot, text)
+        else:
+            logger.info("回復完成：%s（操作者：%s）", name, operator)
+            text = (
+                f"【成功】回復完成（回復前快照：`{outcome.snapshot}`，"
+                f"flow {outcome.flow_id}，耗時 {outcome.duration:.0f} 秒）"
+            )
+            await progress(text)
+            await _notify_owner(self.bot, text)
+
+    # ── 開關每日自動備份 ──────────────────────
+    @qb_group.command(name="schedule", description="開啟或關閉每日自動備份")
+    @app_commands.describe(action="on 開啟、off 關閉")
+    @app_commands.choices(action=[
+        app_commands.Choice(name="on", value="on"),
+        app_commands.Choice(name="off", value="off"),
+    ])
+    async def schedule(self, interaction: discord.Interaction, action: app_commands.Choice[str]) -> None:
+        if not self._authorized(interaction):
+            await interaction.response.send_message("你沒有權限使用這個指令", ephemeral=True)
             return
 
-        async with _lock:
-            await ctx.send(f"回復 `{name}` 開始")
-            await _notify_owner(self.bot, f"{ctx.author} 觸發回復：{name}")
+        enabled = action.value == "on"
+        scheduler.set_enabled(enabled)
+        logger.info("每日自動備份設定為 %s（操作者：%s）", "開啟" if enabled else "關閉", interaction.user)
 
-            if rcon.configured():
-                await ctx.send(f"先廣播提醒玩家，等 {config.QB_RCON_WARN_SECONDS} 秒再關伺服器...")
-                await rcon.warn_and_wait(f"伺服器即將回復備份並重啟，{config.QB_RCON_WARN_SECONDS} 秒後關閉")
+        if not enabled:
+            await interaction.response.send_message("已關閉每日自動備份", ephemeral=True)
+            return
 
-            await ctx.send("關伺服器中...")
-            if not await server.stop():
-                await ctx.send("伺服器沒關乾淨，回復中止，麻煩自己上去看一下")
-                logger.error("qb back：關閉伺服器逾時（操作者：%s）", ctx.author)
-                await _notify_owner(self.bot, f"回復中止：伺服器關閉逾時（{ctx.author}）")
-                history.record("back", str(ctx.author), name, False, "伺服器關閉逾時")
-                return
-
-            snapshot_name = backup.default_filename(config.QB_PRE_RESTORE_PREFIX)
-            await ctx.send(f"關好了，先幫現況存一份快照 `{snapshot_name}`...")
-            await asyncio.to_thread(backup.create, snapshot_name)
-
-            await ctx.send("快照存好了，開始回復...")
-            ok, detail = await asyncio.to_thread(backup.restore, name)
-
-            restarted = server.start()
-            restart_note = "伺服器已重啟" if restarted else "但伺服器沒能正常拉起來，麻煩自己上去看一下"
-
-            if ok:
-                result = f"【成功】回復完成，{restart_note}（回復前快照：`{snapshot_name}`）"
-                logger.info("回復完成：%s（操作者：%s）", name, ctx.author)
-            else:
-                result = f"【失敗】回復出包：{detail}，{restart_note}"
-                logger.error("回復失敗：%s（操作者：%s）", detail, ctx.author)
-
-            history.record("back", str(ctx.author), name, ok, detail)
-            await ctx.send(result)
-            await _notify_owner(self.bot, result)
+        next_run = self._daily_backup.next_iteration
+        when = ""
+        if next_run is not None:
+            when = f"，下次執行時間約為 {next_run.astimezone(config.QB_AUTO_BACKUP_TZ):%Y-%m-%d %H:%M}"
+        await interaction.response.send_message(f"已開啟每日自動備份{when}", ephemeral=True)
 
     # ── 查看伺服器狀態與最近操作紀錄 ──────────────────────
-    @commands.command(name="info")
-    async def info(self, ctx: commands.Context) -> None:
-        if not _authorized(ctx):
+    @app_commands.command(name="info", description="查看伺服器狀態與最近的備份／回復紀錄")
+    async def info(self, interaction: discord.Interaction) -> None:
+        if not self._authorized(interaction):
+            await interaction.response.send_message("你沒有權限使用這個指令", ephemeral=True)
             return
 
-        running = server.is_running()
-        status_text = "線上" if running else "離線"
-        lines = [f"伺服器狀態：{status_text}"]
+        current_state = await server.status()
+        lines = [f"伺服器狀態：{_STATE_LABELS.get(current_state, current_state.value)}"]
 
-        if running and rcon.configured():
-            players = await rcon.player_summary()
-            if players:
-                lines.append(f"玩家：{players}")
-
+        auto_text = "開啟" if scheduler.is_enabled() else "關閉"
+        next_run = self._daily_backup.next_iteration
+        if scheduler.is_enabled() and next_run is not None:
+            auto_text += f"（下次執行：{next_run.astimezone(config.QB_AUTO_BACKUP_TZ):%Y-%m-%d %H:%M}）"
+        lines.append(f"每日自動備份：{auto_text}")
         lines.append("")
 
         entries = history.recent(10)
@@ -275,11 +311,50 @@ class QuickBackup(commands.Cog):
         else:
             lines.append("最近的操作：")
             for i, entry in enumerate(entries, 1):
-                mark = "成功" if entry["success"] else "失敗"
-                lines.append(f"[{i}] {entry['time']}  {entry['action']}  {entry['target']}")
-                lines.append(f"    操作者：{entry['user']}　結果：【{mark}】{entry['detail']}")
+                mark = "成功" if entry.success else "失敗"
+                duration_text = f"，耗時 {entry.duration:.0f} 秒" if entry.duration is not None else ""
+                lines.append(f"[{i}] {entry.time}　{entry.action}　{entry.target}")
+                lines.append(f"    操作者：{entry.user}　結果：【{mark}】{duration_text}　{entry.detail}")
 
-        await ctx.send("```text\n" + "\n".join(lines) + "\n```")
+        await interaction.response.send_message("```text\n" + "\n".join(lines) + "\n```")
+
+    # ── 每日自動備份背景任務：所有例外都攔在這裡，單次失敗不影響隔天繼續跑 ──────────────────────
+    @tasks.loop(time=_AUTO_BACKUP_TIME)
+    async def _daily_backup(self) -> None:
+        try:
+            await self._run_daily_backup()
+        except Exception:
+            # 這裡刻意接住「所有」例外，不只 QBError：tasks.loop 一旦讓例外
+            # 逃出這個函式，整個排程就會永久停止，之後每天都不會再觸發，
+            # 必須確保無論出什麼包，明天都還會再試一次。
+            logger.exception("每日自動備份發生未預期的錯誤")
+
+    async def _run_daily_backup(self) -> None:
+        if not scheduler.is_enabled():
+            return
+
+        name = backup.default_filename(config.QB_AUTO_BACKUP_PREFIX)
+        logger.info("每日自動備份開始：%s", name)
+
+        try:
+            outcome = await backup.run_backup(name, operator="每日自動備份")
+        except QBError as exc:
+            logger.error("每日自動備份失敗：%s", exc)
+            await _notify_owner(self.bot, f"【失敗】每日自動備份失敗：{exc}")
+            return
+
+        removed = backup.rotate_auto_backups(config.QB_AUTO_BACKUP_PREFIX, config.QB_AUTO_BACKUP_KEEP)
+        if removed:
+            logger.info("自動備份輪替：刪除 %d 份舊備份", len(removed))
+
+        await _notify_owner(
+            self.bot,
+            f"【成功】每日自動備份完成，大小 {outcome.size}（耗時 {outcome.duration:.0f} 秒）",
+        )
+
+    @_daily_backup.before_loop
+    async def _before_daily_backup(self) -> None:
+        await self.bot.wait_until_ready()
 
 
 async def setup(bot: commands.Bot) -> None:
