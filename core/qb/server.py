@@ -36,6 +36,7 @@ Description():
 - 每個函式都接受選填的 flow 參數：不給就自己開一個新的 Flow；在
   backup／restore 這類多步驟流程裡，把同一個 Flow 往下傳，log 裡
   就能看到整段操作共用同一個 Flow ID。
+- 刪除執行任意 Console 指令
 """
 
 from __future__ import annotations
@@ -91,22 +92,3 @@ async def restart(*, flow: Flow | None = None) -> None:
     async with state.guarded((state.server_lock, "伺服器目前正被其他作業占用，請稍後再試")):
         await stop(flow=f)
         await start(flow=f)
-
-
-async def send_command(command: str, *, flow: Flow | None = None) -> str:
-    """對正在執行的伺服器送一行主控台指令。
-
-    回傳值是 command.sh 這支 script 自己的 stdout（通常是空字串），
-    不是 Minecraft 主控台執行完指令後的回應——tmux send-keys 只是把
-    按鍵送進 session，是單向的，不會把 session 當下的輸出讀回來。
-    如果之後需要「送指令＋讀回應」，得另外用 tmux capture-pane 或
-    RCON 之類的方式，不是這個函式的範圍。
-    """
-    f = flow or Flow("server.command")
-    if not await is_running(flow=f):
-        raise ServerError("伺服器目前沒有在執行，無法送出指令")
-    try:
-        result = await f.run_script("command.sh", command)
-    except TMUXError as exc:
-        raise ServerError(f"送出指令失敗：{exc}") from exc
-    return result.stdout

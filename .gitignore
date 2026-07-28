@@ -2,6 +2,7 @@
 __pycache__/
 *.pyc
 .venv/
-database/logs/
+database/log/
+database/qb/
 *.log
 .DS_Store
