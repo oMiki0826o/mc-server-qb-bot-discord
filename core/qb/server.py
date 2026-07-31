@@ -3,40 +3,34 @@ core/qb/server.py
 
 Modification():
 
-- 全面改為呼叫 core/qb/scripts/ 底下的 shell script（透過
+- 刪除 send_command()：原本讓外部可以對執行中的伺服器送任意一行主控台
+  指令（例如 whitelist／op／say…），等於是把「什麼指令都能送」這個
+  權限開放出去，風險跟能力不成比例——目前沒有任何 Discord 指令在用
+  它，純粹是為了「以後可能用得到」而留的後門。拿掉之後 server.py
+  能做的事收斂成明確的五種變成四種：啟動、關閉、重啟、查狀態，
+  每一種都清楚知道會發生什麼事，不會有「這次要送的指令到底安不
+  安全」這種要另外評估的模糊地帶。對應的 core/qb/scripts/command.sh
+  也一併刪除。
+- 其餘不變：全面呼叫 core/qb/scripts/ 底下的 shell script（透過
   core/qb/process.py 的 Flow／run_script），不再由這支檔案自己組
-  tmux 指令。「怎麼判斷伺服器活著、怎麼關、怎麼開」全部收斂到
-  scripts/ 底下，以後要換掉行程監控方式（例如改用 systemd 或
-  docker），只需要換掉對應的 script，這支檔案完全不用動。
-- 新增 restart()：依序呼叫 stop() 與 start()，並自己取得
-  state.server_lock，適合被獨立呼叫。若要在「已經持有 server_lock
-  的流程」裡重啟（例如 backup.py 的備份流程），請直接照順序呼叫
-  stop()／start()，不要呼叫 restart()——stop()／start() 都不會自己
-  搶 server_lock，才不會跟外層流程已經持有的鎖形成死結。
-- 新增 send_command()：對正在執行的伺服器送一行主控台指令，以後要
-  加 /say、/whitelist 這類指令時，不用再讓 cogs 直接碰 tmux。
-- status() 改為回傳 core.qb.state.State，不是單純的布林值：如果目前
-  有備份／回復／重啟之類的流程在跑，回傳的就是那個流程當下的狀態
-  （例如 BackingUp，或流程內部呼叫 stop() 時短暫看到 Stopping）；
-  沒有流程在跑，才回報 Running／Stopped／Failed。is_running() 保留
-  成單純的布林版本，給只在乎「現在是否在跑」、不在乎流程細節的地方
-  用（例如 send_command() 自己的前置檢查）。
-- 所有函式改成 async：底層都要呼叫子行程，統一成 async 介面，呼叫端
-  不用去記哪個函式是同步、哪個是非同步。
-- 移除直接呼叫 subprocess／tmux 的程式碼，改為透過 process.py。
+  tmux 指令。
 
 Description():
 
 - is_running()：純粹問「tmux session 現在還在嗎」，不牽涉狀態機。
-- status()：給 /info 這類指令用的完整狀態。
+- status()：給 /info 這類指令用的完整狀態；如果目前有備份／回復／
+  重啟之類的流程在跑，回傳的就是那個流程當下的狀態，沒有流程在跑
+  才回報 Running／Stopped／Failed。
 - start()／stop()：伺服器生命週期最基本的兩個動作，不處理鎖，由
   呼叫端（backup.py 或未來的獨立指令）自行決定要不要保護。
-- restart()：獨立可用的重啟，自帶 server_lock 保護。
-- send_command(command)：對執行中的伺服器送一行主控台指令。
+- restart()：獨立可用的重啟，自帶 server_lock 保護；若要在已經
+  持有 server_lock 的流程裡重啟（例如 backup.py 的備份流程），
+  請直接照順序呼叫 stop()／start()，不要呼叫 restart()——stop()／
+  start() 都不會自己搶 server_lock，才不會跟外層流程已經持有的鎖
+  形成死結。
 - 每個函式都接受選填的 flow 參數：不給就自己開一個新的 Flow；在
   backup／restore 這類多步驟流程裡，把同一個 Flow 往下傳，log 裡
   就能看到整段操作共用同一個 Flow ID。
-- 刪除執行任意 Console 指令
 """
 
 from __future__ import annotations

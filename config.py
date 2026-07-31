@@ -6,15 +6,16 @@ Modification():
 - 移除 RCON 相關設定（QB_RCON_HOST／QB_RCON_PORT／QB_RCON_PASSWORD／
   QB_RCON_WARN_SECONDS）：這套功能判定為用不到的設計，直接砍掉，
   不再是「選填但沒人用」的殘留設定。
-- QB_BACKUP_DIR 改為選填：預設值改成專案內的
-  database/minecraft/Backup/，不用再手動填一個外部絕對路徑；不管是
-  用預設值還是自己填，程式啟動時都會自動建立資料夾，不存在也不會
-  出錯。
+- QB_BACKUP_DIR 維持必填、由使用者自訂路徑（曾經試過改成選填、預設
+  指到專案內的 database/minecraft/Backup/，後來評估備份通常要放在
+  容量更大、跟專案本體分開的磁碟，改回要求使用者自己指定，不猜測）；
+  不過不管填的是哪裡，程式啟動時都會自動建立資料夾，路徑本身不存在
+  不會讓程式報錯拒絕啟動。
 - QB_HISTORY_FILE／QB_STOP_TIMEOUT／QB_HISTORY_KEEP／
-  QB_BACKUP_PREFIX／QB_PRE_RESTORE_PREFIX 一併改為選填並給預設值：
-  這些填錯了頂多是行為不如預期，不像 QB_SERVER_DIR 那種填錯會讓
-  備份／回復動到錯資料夾、覆水難收的等級，所以放寬成「沒填就用
-  預設值」，降低第一次部署要填的欄位數量。
+  QB_BACKUP_PREFIX／QB_PRE_RESTORE_PREFIX 改為選填並給預設值：這些
+  填錯了頂多是行為不如預期，不像 QB_SERVER_DIR／QB_BACKUP_DIR 這種
+  填錯會讓備份／回復動到錯資料夾、覆水難收的等級，所以放寬成「沒填
+  就用預設值」，降低第一次部署要填的欄位數量。
 - 新增 QB_SCRIPT_DIR：core/qb/scripts/ 底下 shell script 的所在
   目錄，預設是專案內建的 core/qb/scripts，開機時會確認裡面該有的
   script 都存在，缺一個就直接拒絕啟動並列出缺項。
@@ -26,16 +27,20 @@ Modification():
 - OWNER_ID／QB_CHANNEL_ID／QB_ROLE_ID 改用共用的整數解析函式，
   格式錯誤時會直接說明是哪個變數、目前的值是什麼，而不是丟一個
   看不懂的 ValueError traceback。
+- _EXPECTED_SCRIPTS 拿掉 command.sh：對應 server.py 刪除
+  send_command()，這支 script 已經不存在，繼續留在檢查清單裡只會讓
+  開機檢查誤判成「缺檔案」。
 
 Description():
 
 - 一律用 python-dotenv 讀取專案根目錄的 .env。
 - 必填的環境變數：DISCORD_TOKEN／OWNER_ID／QB_CHANNEL_ID／
-  QB_ROLE_ID／QB_SERVER_DIR／QB_SESSION_NAME／QB_START_COMMAND。
-  這幾項要嘛沒有安全的預設值（Token、Discord ID），要嘛填錯會讓
-  備份／回復這種做錯就回不去的操作動到錯地方（QB_SERVER_DIR／
-  QB_SESSION_NAME／QB_START_COMMAND），所以少一個都直接拒絕啟動，
-  一次列出全部缺項，不會用猜的值偷偷跑起來。
+  QB_ROLE_ID／QB_SERVER_DIR／QB_SESSION_NAME／QB_START_COMMAND／
+  QB_BACKUP_DIR。這幾項要嘛沒有安全的預設值（Token、Discord ID），
+  要嘛填錯會讓備份／回復這種做錯就回不去的操作動到錯地方（
+  QB_SERVER_DIR／QB_SESSION_NAME／QB_START_COMMAND／
+  QB_BACKUP_DIR），所以少一個都直接拒絕啟動，一次列出全部缺項，
+  不會用猜的值偷偷跑起來。
 - 其餘設定都選填，沒填就用本檔案集中定義的預設值。
 - 相對路徑一律視為相對於本檔案所在的專案根目錄，跟啟動時的工作
   目錄無關。
@@ -61,7 +66,6 @@ _DEFAULT_STOP_TIMEOUT = 120
 _DEFAULT_HISTORY_KEEP = 50
 _DEFAULT_BACKUP_PREFIX = "backup"
 _DEFAULT_PRE_RESTORE_PREFIX = "prerestore"
-_DEFAULT_BACKUP_DIR = PROJECT_ROOT / "database" / "minecraft" / "Backup"
 _DEFAULT_HISTORY_FILE = PROJECT_ROOT / "database" / "qb" / "history.json"
 _DEFAULT_SCRIPT_DIR = PROJECT_ROOT / "core" / "qb" / "scripts"
 _DEFAULT_SCHEDULE_FILE = PROJECT_ROOT / "database" / "qb" / "schedule.json"
@@ -79,6 +83,7 @@ _REQUIRED = [
     "QB_SERVER_DIR",
     "QB_SESSION_NAME",
     "QB_START_COMMAND",
+    "QB_BACKUP_DIR",
 ]
 
 _missing = [key for key in _REQUIRED if not os.getenv(key)]
@@ -147,8 +152,9 @@ QB_STOP_TIMEOUT = _int_env("QB_STOP_TIMEOUT", _DEFAULT_STOP_TIMEOUT)
 # ── script runner 設定 ──────────────────────
 QB_SCRIPT_DIR = _path_env("QB_SCRIPT_DIR", _DEFAULT_SCRIPT_DIR)
 
-# ── 備份／回復設定 ──────────────────────
-QB_BACKUP_DIR = _path_env("QB_BACKUP_DIR", _DEFAULT_BACKUP_DIR)
+# ── 備份／回復設定：QB_BACKUP_DIR 由使用者自訂，通常指向專案以外、
+#    空間夠大的磁碟，所以刻意不給預設值、跟 QB_SERVER_DIR 一樣必填 ──────────────────────
+QB_BACKUP_DIR = Path(os.getenv("QB_BACKUP_DIR", ""))
 QB_BACKUP_PREFIX = os.getenv("QB_BACKUP_PREFIX") or _DEFAULT_BACKUP_PREFIX
 QB_PRE_RESTORE_PREFIX = os.getenv("QB_PRE_RESTORE_PREFIX") or _DEFAULT_PRE_RESTORE_PREFIX
 
@@ -171,7 +177,7 @@ QB_SCHEDULE_FILE.parent.mkdir(parents=True, exist_ok=True)
 
 # ── script 目錄本身跟著專案走，缺檔多半代表部署時漏複製，直接拒絕啟動並列清楚 ──────────────────────
 _EXPECTED_SCRIPTS = (
-    "start.sh", "stop.sh", "restart.sh", "status.sh", "save.sh", "command.sh",
+    "start.sh", "stop.sh", "restart.sh", "status.sh", "save.sh",
 )
 _missing_scripts = [
     name for name in _EXPECTED_SCRIPTS if not (QB_SCRIPT_DIR / name).is_file()

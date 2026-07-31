@@ -1,7 +1,7 @@
 # qb-bot
 
 ![Version](https://img.shields.io/badge/version-1.1-blue)
-![License](https://img.shields.io/badge/license-PolyForm_Noncommercial_1.0.0-green)
+![License](https://img.shields.io/badge/license-PolyForm--Noncommercial--1.0.0-green)
 ![Tech](https://img.shields.io/badge/stack-Python-lightgrey)
 ![Python](https://img.shields.io/badge/Python-3.9%2B-orange)
 
